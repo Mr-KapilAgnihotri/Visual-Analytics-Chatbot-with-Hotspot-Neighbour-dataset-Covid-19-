@@ -41,7 +41,7 @@ and without a Groq key it uses its rule-based parser and template text.
 ```powershell
 python -m etl.run_all                  # clean -> borders -> DuckDB -> Neo4j
 python -m tests.check_neo4j_parity     # proves Neo4j answers == reference answers
-python -m pytest -q                    # 47 automated tests
+python -m pytest -q                    # 68 automated tests
 ```
 (`python -m etl.run_all --no-neo4j` if Neo4j is not running yet.
 Stop the API and the chat UI before re-running the ETL, because DuckDB allows only one writer.)
@@ -53,6 +53,42 @@ uvicorn backend.main:app --reload      # terminal 1: API  -> http://127.0.0.1:80
 streamlit run frontend/app.py          # terminal 2: chat -> http://localhost:8501
 ```
 The chat UI also works without terminal 1: it then answers in-process.
+
+## Conversation memory (follow-up questions)
+
+The chatbot remembers each conversation, so short follow-ups work:
+
+| You ask | It understands |
+|---|---|
+| Top 10 districts by incidence on 15 November | (a complete question) |
+| And on 1 December? | the same ranking, for 1 December |
+| Show their trend | the trend of **those** districts (at most 8 lines) |
+| Only the ones in Bavaria | the same, restricted to Bavaria |
+| What about deaths? | the same, with deaths instead of incidence |
+| Now as a map | the same measure, drawn as a map |
+
+Also: "What about Hamburg?" (swap the place), "also add Hessen" (add a place),
+"its neighbours", "Which of them are hotspots?", "and within 3?", and answering
+the bot's own question ("neighbours of" -> "Which district?" -> "Köln").
+
+**How it works (dialogue-state tracking with slot carry-over):**
+1. Every QueryPlan records which details the user actually *stated* (`explicit`).
+2. `backend/followup.py` decides whether a question is a follow-up (linking words such as
+   "and / what about / only", pointing words such as "their / its", or a short question
+   that gives only a date, place or measure). A complete new question starts fresh.
+3. Stated details override the previous plan; unstated ones are inherited.
+   "Their / them / those" point to the districts the previous **answer** showed (result memory).
+4. The resolved plan passes the usual validation (`finalize`), then the normal pipeline runs.
+5. The answer shows how it was understood ("↪ Follow-up to …: changed …; kept …").
+
+**Where memory lives:** `backend/memory.py`, in the API process only (never in DuckDB):
+the last 10 turns per conversation, forgotten after 60 minutes of inactivity.
+With an LLM key, the model also sees a ~100-token summary of the previous plan
+(never the chat text); its output is validated as before. Without a key, the rules do it all.
+
+**API:** `POST /ask` accepts and returns a `session_id`; send it back with the next question.
+`POST /reset {"session_id": ...}` forgets a conversation. The chat screen does this for you;
+its "New topic" button clears the memory.
 
 ## 4. Benchmark (which engine is faster for what)
 
@@ -106,8 +142,8 @@ Writes `benchmarks/results.csv` and an interactive `benchmarks/results.html`.
 ```
 data/        raw CSV, derived files (clean.parquet, adjacency.json, covid.duckdb)
 etl/         clean.py, build_adjacency.py, load_duckdb.py, graph_payload.py, load_neo4j.py, run_all.py
-backend/     config, catalog, entities, nlu, llm, sql_engine, graph_engine, charts, narrator, orchestrator, main (API)
+backend/     config, catalog, entities, nlu, followup, memory, llm, sql_engine, graph_engine, charts, narrator, orchestrator, main (API)
 frontend/    app.py (Streamlit) + static/topojson (map outlines, served locally)
 benchmarks/  run_benchmark.py
-tests/       test_pipeline.py, check_neo4j_parity.py
+tests/       test_pipeline.py, test_memory.py, check_neo4j_parity.py
 ```

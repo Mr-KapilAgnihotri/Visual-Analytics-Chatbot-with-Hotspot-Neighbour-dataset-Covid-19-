@@ -263,6 +263,14 @@ class EntityLinker:
 
     def _dates(self, q: str, ex: Extraction) -> None:
         ql = q.lower()
+        holidays = {r"christmas eve": "2020-12-24", r"christmas( day)?|xmas": "2020-12-25",
+                    r"new year'?s eve|silvester": "2020-12-31", r"boxing day": "2020-12-26",
+                    r"easter( sunday)?": "2020-04-12"}
+        for pat, day in holidays.items():
+            if re.search(rf"\b({pat})\b", ql):
+                ex.date = day
+                ex.notes.append(f"interpreted as {day}")
+                return
         if re.search(r"first wave", ql):
             ex.start, ex.end = "2020-03-01", "2020-05-31"
             ex.notes.append("first wave = March-May 2020")

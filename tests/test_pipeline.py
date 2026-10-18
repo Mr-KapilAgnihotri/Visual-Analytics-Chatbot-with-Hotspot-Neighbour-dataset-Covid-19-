@@ -99,14 +99,43 @@ def test_rule_intents(linker, q, intent):
 
 
 def test_llm_merge_validates(linker):
-    """A fake LLM answer: valid fields are used, invalid ones are ignored."""
-    base = rule_plan("show me stuff about munich", linker.extract("show me stuff about munich"))
+    """A fake LLM answer: valid fields fill the gaps, invalid ones are ignored."""
+    q = "munich stuff"                                     # the rules recognise no question type here
+    base = rule_plan(q, linker.extract(q))
     fake = {"intent": "k_hop", "metric": "new_cases", "hops": 3, "order": "sideways", "n": 999,
             "places": ["Munich"], "date": "2021-05-01"}
     p = merge_llm(base, fake, linker, "q")
     assert (p.intent, p.metric, p.hops, p.nlu_source) == ("k_hop", "new_cases", 3, "llm")
     assert p.order == "desc" and p.n == base.n            # invalid values ignored
     assert p.date == config.LAST_DATE                     # out-of-range date clamped
+
+
+def test_llm_never_overrules_the_rules(linker):
+    """Regression: with Groq on, the LLM turned "When did Germany have the most new cases?"
+    (a timeline) into a ranking. Slots the rules recognised must win."""
+    q = "When did Germany have the most new cases?"
+    base = rule_plan(q, linker.extract(q))
+    p = merge_llm(base, {"intent": "top_n", "metric": "deaths"}, linker, q)
+    assert (p.intent, p.metric) == ("trend", "new_cases")
+
+
+def test_llm_keeps_type_in_followup(orch, monkeypatch):
+    """Regression: in a conversation, the LLM turned "also add Hessen" (a monthly trend)
+    into a comparison. A question type only the LLM saw must not replace the remembered one."""
+    import uuid
+    from backend import nlu
+
+    class FakeLLM:
+        enabled = True
+
+        def complete_json(self, *a, **k):
+            return {"intent": "compare", "places": ["Hessen"]}
+
+    s = uuid.uuid4().hex
+    orch.ask("Compare Bavaria and Saxony monthly new cases", s)
+    monkeypatch.setattr(nlu, "get_llm", lambda: FakeLLM())
+    a = orch.ask("also add Hessen", s)
+    assert a.intent == "trend" and set(a.plan["states"]) == {"Freistaat Bayern", "Sachsen", "Hessen"}
 
 
 # ---------------------------------------------------------------- end to end

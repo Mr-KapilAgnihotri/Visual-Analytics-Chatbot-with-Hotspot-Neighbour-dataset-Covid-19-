@@ -28,6 +28,7 @@ from backend.catalog import INTENTS, METRICS, engine_for, metric_label
 from backend.charts import CONTEXT, FOCUS, HOTSPOT, SERIES, fmt
 from backend.entities import EntityLinker
 from backend.graph_engine import GraphResult, get_graph, graph_status
+from backend.memory import ConversationStore, Turn
 from backend.narrator import narrate
 from backend.nlu import QueryPlan, understand
 from backend.sql_engine import SqlResult, get_sql
@@ -59,6 +60,8 @@ class Answer:
     plan: dict = field(default_factory=dict)
     notes: list = field(default_factory=list)
     graph_backend: str = ""
+    session_id: str | None = None
+    followup: str | None = None          # how a follow-up was interpreted, shown to the user
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -78,20 +81,25 @@ class Orchestrator:
         self.districts = self.sql.districts()                # 411 rows, cached for coordinates
         self.linker = EntityLinker(self.districts)
         self._all_edges: list | None = None
+        self.memory = ConversationStore()                     # conversation memory, per session_id
 
     # ------------------------------------------------------------------
-    def ask(self, question: str) -> Answer:
+    def ask(self, question: str, session_id: str | None = None) -> Answer:
+        """Answer one question. With a session_id, earlier turns of that conversation are
+        remembered, so follow-ups ("and on 1 December?", "their trend") work."""
         t0 = time.perf_counter()
         self._queries: list[dict] = []
-        plan, _ = understand(question, self.linker)
+        last = self.memory.last(session_id)
+        plan, _ = understand(question, self.linker, last)
         t_nlu = (time.perf_counter() - t0) * 1000
 
         ans = Answer(question=question, intent=plan.intent, engine=engine_for(plan.intent), text="",
                      nlu_source=plan.nlu_source, plan=plan.to_dict(), notes=list(plan.notes),
-                     graph_backend=self.graph.backend)
+                     graph_backend=self.graph.backend, session_id=session_id, followup=plan.followup)
         if plan.clarification:
             ans.text, ans.engine = plan.clarification, "NONE"
             ans.timings = {"nlu_ms": round(t_nlu, 1), "total_ms": round((time.perf_counter() - t0) * 1000, 1)}
+            self._remember(session_id, question, plan, [])     # so "Köln" can answer the question
             return ans
         if plan.intent == "help":
             ans.text, ans.engine = HELP_TEXT, "NONE"
@@ -121,7 +129,36 @@ class Orchestrator:
             "narrate_ms": round(t_narr, 1),
             "total_ms": round((time.perf_counter() - t0) * 1000, 1),
         }
+        self._remember(session_id, question, plan, table)
         return ans
+
+    # ------------------------------------------------------------------
+    # memory
+    # ------------------------------------------------------------------
+    def _remember(self, session_id: str | None, question: str, plan: QueryPlan, table: list) -> None:
+        """Store this turn: the plan, plus WHICH districts/states the answer showed
+        (so a later "their" or "them" points at exactly what was on screen)."""
+        if not session_id:
+            return
+        ids: list[int] = []
+        for r in table or []:
+            v = r.get("district_id", r.get("id"))
+            if isinstance(v, (int, np.integer)) and int(v) not in ids:
+                ids.append(int(v))
+        if not ids:
+            ids = [int(d["id"]) for d in plan.districts]
+        states: list[str] = []
+        if plan.intent in ("top_n", "share") and (plan.level == "state" or plan.intent == "share"):
+            states = [r["name"] for r in table if r.get("name")]
+        elif plan.intent == "state_borders":
+            states = [r["state"] for r in table if r.get("state")]
+        elif plan.intent == "compare":
+            states = [r["name"] for r in table if r.get("kind") == "state"]
+        if states:
+            ids = [i for i in ids if i in set(self.districts["district_id"])] if plan.intent == "compare" else []
+        states = states or list(plan.states)
+        self.memory.add(session_id, Turn(question=question, plan=plan.to_dict(),
+                                         result_ids=ids[:50], result_states=states))
 
     # ------------------------------------------------------------------
     # helpers
@@ -225,7 +262,8 @@ class Orchestrator:
         df = self._sql(self.sql.trend(p.metric, ids, p.states, start, end, gran), f"{lab} over time")
         if df.empty:
             return None, {}, "No data for that period.", [], []
-        places = ", ".join([d["name"] for d in p.districts] + p.states) or "Germany"
+        names = [d["name"] for d in p.districts] + p.states
+        places = (", ".join(names[:3]) + (f" and {len(names) - 3} more" if len(names) > 3 else "")) or "Germany"
         per = {"day": "daily", "week": "weekly", "month": "monthly"}[gran]
         title = f"{lab} ({per}) – {places}, {_d(start)} to {_d(end)}"
         fig = charts.lines(df, title, lab, config.HOTSPOT_THRESHOLD if p.metric == "incidence_7d" else None)
@@ -342,11 +380,14 @@ class Orchestrator:
     def _h_snapshot_map(self, p: QueryPlan):
         metric = p.metric if p.metric != "hotspot" else "incidence_7d"
         lab = metric_label(metric)
-        df = self._sql(self.sql.snapshot(metric, p.date, None, p.start if METRICS[metric]["period"] != "last" else None,
-                                         p.end if METRICS[metric]["period"] != "last" else None),
-                       f"{lab} for every district")
+        # a level metric (incidence, total cases) over a period is shown on the period's LAST day;
+        # the date must be fixed BEFORE the query runs, so the label and the data always agree
         if METRICS[metric]["period"] == "last" and p.end and not p.date:
             p.date = p.end
+        use_period = METRICS[metric]["period"] != "last" and p.start and p.end
+        df = self._sql(self.sql.snapshot(metric, p.date, None, p.start if use_period else None,
+                                         p.end if use_period else None),
+                       f"{lab} for every district")
         when = self._snapshot_desc(p, metric)
         fig = charts.value_map(df, f"{lab} by district, {when}", lab)
         top = df.nlargest(5, "value")
@@ -385,7 +426,9 @@ class Orchestrator:
             text = (f"{name} ({prof['state']}, population {int(prof['population']):,}) recorded "
                     f"{int(prof['total_cases']):,} cases in 2020. Its 7-day incidence peaked at "
                     f"{prof['peak_incidence']:.0f} on {_d(prof['peak_date'])}, and it was a hotspot on "
-                    f"{int(prof['days_as_hotspot'])} days. It borders {len(nb.rows)} districts.")
+                    f"{int(prof['days_as_hotspot'])} days"
+                    + (f", first on {_d(prof['first_hotspot'])}" if pd.notna(prof["first_hotspot"]) else "")
+                    + f". It borders {len(nb.rows)} districts.")
         else:
             st = p.states[0]
             prof = self._sql(self.sql.state_profile(st), "state key figures").iloc[0]
@@ -408,6 +451,36 @@ class Orchestrator:
         fig = charts.lines(trend, f"7-day incidence per 100k – {name}, 2020", "7-day incidence per 100k",
                            config.HOTSPOT_THRESHOLD)
         return fig, facts, text, [], kpis
+
+    def _h_subset(self, p: QueryPlan):
+        """A metric for exactly the districts of the previous answer
+        (follow-ups such as "which of them are hotspots?" or "show their deaths")."""
+        metric = p.metric if p.metric != "hotspot" else "incidence_7d"
+        lab = metric_label(metric)
+        ids = [d["id"] for d in p.districts]
+        df, when = self._metric_snapshot(p, metric, ids)
+        if df.empty:
+            return None, {}, "No data for those districts.", [], []
+        hot = metric == "incidence_7d"
+        fig = charts.bar_ranking(df, f"{lab}: the {len(df)} districts from the previous answer, {when}", lab,
+                                 "hotspot" if hot else "focus")
+        facts = {"metric": lab, "period": when, "districts": len(df),
+                 "values": [{"name": r["name"], "value": round(float(r["value"]), 1)}
+                            for _, r in df.sort_values("value", ascending=False).iterrows()]}
+        if hot:
+            hs = df[df["value"] >= config.HOTSPOT_THRESHOLD].sort_values("value", ascending=False)
+            facts["hotspots"] = int(len(hs))
+            facts["hotspot_names"] = hs["name"].tolist()
+            text = (f"{len(hs)} of these {len(df)} districts were hotspots {when}"
+                    + (f": {', '.join(hs['name'].head(10))}." if len(hs) else "."))
+        else:
+            top = df.sort_values("value", ascending=False).iloc[0]
+            text = f"Among these {len(df)} districts, {top['name']} has the highest {lab.lower()} {when} ({fmt(top['value'])})."
+        if p.threshold is not None:
+            above = df[df["value"] > p.threshold]
+            facts["above_threshold"] = int(len(above))
+            text += f" {len(above)} are above {p.threshold:g}."
+        return fig, facts, text, self._records(df.sort_values("value", ascending=False)), []
 
     # ==================================================================
     # GRAPH handlers
@@ -601,9 +674,12 @@ class Orchestrator:
                  "clusters_with_2_or_more": len(big), "single_isolated_hotspots": sum(1 for c in cl.rows if c["size"] == 1),
                  "largest_clusters": [{"size": c["size"], "states": sorted(st[c["ids"]].unique().tolist())} for c in cl.rows[:3]]}
         largest = cl.rows[0]
-        text = (f"On {_d(day)} there were {len(ids)} hotspot districts. Following shared borders, they form "
-                f"{len(cl.rows)} connected groups; the largest joins {largest['size']} districts across "
-                f"{len(facts['largest_clusters'][0]['states'])} federal states.")
+        def pl(n, one, many):
+            return f"{n} {one if n == 1 else many}"
+        text = (f"On {_d(day)} there {'was' if len(ids) == 1 else 'were'} {pl(len(ids), 'hotspot district', 'hotspot districts')}. "
+                f"Following shared borders, they form {pl(len(cl.rows), 'connected group', 'connected groups')}; "
+                f"the largest joins {pl(largest['size'], 'district', 'districts')} across "
+                f"{pl(len(facts['largest_clusters'][0]['states']), 'federal state', 'federal states')}.")
         table = [{"cluster": c["cluster"], "size": c["size"],
                   "districts": ", ".join(self.districts.set_index('district_id').loc[c['ids'][:12], 'name'])
                   + (" …" if c["size"] > 12 else "")} for c in cl.rows[:20]]

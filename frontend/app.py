@@ -10,6 +10,7 @@ demo keeps working either way.
 from __future__ import annotations
 
 import sys
+import uuid
 from pathlib import Path
 
 import pandas as pd
@@ -48,15 +49,31 @@ def api_up() -> bool:
 
 
 def ask(question: str) -> dict:
+    """Send the question WITH this chat's session_id, so the backend remembers earlier turns."""
+    sid = st.session_state["session_id"]
     if st.session_state.get("mode") == "api":
         try:
-            r = requests.post(f"{config.API_URL}/ask", json={"question": question}, timeout=90)
+            r = requests.post(f"{config.API_URL}/ask", json={"question": question, "session_id": sid}, timeout=90)
             if r.ok:
                 return r.json()
             return {"text": f"The API returned an error: {r.json().get('detail', r.text)}", "engine": "NONE"}
         except requests.RequestException:
             st.session_state["mode"] = "local"
-    return local_orchestrator().ask(question).to_dict()
+    return local_orchestrator().ask(question, sid).to_dict()
+
+
+def reset_memory() -> None:
+    """Forget the conversation on the backend, then start a fresh session id."""
+    sid = st.session_state.get("session_id")
+    if sid:
+        if st.session_state.get("mode") == "api":
+            try:
+                requests.post(f"{config.API_URL}/reset", json={"session_id": sid}, timeout=5)
+            except requests.RequestException:
+                pass
+        else:
+            local_orchestrator().memory.reset(sid)
+    st.session_state["session_id"] = uuid.uuid4().hex
 
 
 def status() -> dict:
@@ -74,12 +91,16 @@ if "mode" not in st.session_state:
     st.session_state["mode"] = "api" if api_up() else "local"
 if "history" not in st.session_state:
     st.session_state["history"] = []
+if "session_id" not in st.session_state:
+    st.session_state["session_id"] = uuid.uuid4().hex     # one conversation = one memory
 
 
 # ---------------------------------------------------------------------------
 # rendering one answer
 # ---------------------------------------------------------------------------
 def render_answer(a: dict, key: str) -> None:
+    if a.get("followup"):
+        st.caption("↪ " + a["followup"])                     # how a follow-up was understood
     st.markdown(ENGINE_BADGE.get(a.get("engine", "NONE"), ""))
     st.markdown(a.get("text", ""))
     if a.get("kpis"):
@@ -131,8 +152,10 @@ with st.sidebar:
             if st.button(q, key=f"ex-{q}", use_container_width=True):
                 st.session_state["pending"] = q
     st.divider()
-    if st.button("Clear conversation", use_container_width=True):
+    st.caption("Follow-ups work: try \"And on 1 December?\", \"Show their trend\", \"What about Hamburg?\".")
+    if st.button("New topic (clear conversation and memory)", use_container_width=True):
         st.session_state["history"] = []
+        reset_memory()
         st.rerun()
 
 # ---------------------------------------------------------------------------

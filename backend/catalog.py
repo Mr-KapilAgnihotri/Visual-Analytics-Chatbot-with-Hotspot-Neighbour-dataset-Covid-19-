@@ -75,6 +75,7 @@ INTENTS = {
     "hotspot_trend":    ("SQL",    "Number of hotspot districts over time"),
     "snapshot_map":     ("SQL",    "Map of a metric for all districts on one date"),
     "profile":          ("SQL",    "Key figures for one district or state"),
+    "subset":           ("SQL",    "A metric for the districts of the previous answer (follow-ups such as 'which of them are hotspots')"),
     # ---- GRAPH ----
     "neighbours":       ("GRAPH",  "Which districts border a district"),
     "shortest_path":    ("GRAPH",  "Fewest border crossings between two districts"),
