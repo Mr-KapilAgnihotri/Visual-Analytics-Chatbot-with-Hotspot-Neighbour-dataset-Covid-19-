@@ -88,6 +88,7 @@ INTENTS = {
     "surrounded_hotspots": ("HYBRID", "Hotspots whose every neighbour is also a hotspot"),
     "isolated_hotspots": ("HYBRID", "Hotspots with no hotspot neighbour"),
     "help":             ("NONE",   "What the chatbot can do"),
+    "explain":          ("NONE",   "Explains the previous chart in words (no new query, no new chart)"),
 }
 
 

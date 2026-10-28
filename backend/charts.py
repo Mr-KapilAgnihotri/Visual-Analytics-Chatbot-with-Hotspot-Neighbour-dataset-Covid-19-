@@ -47,8 +47,10 @@ def _layout(fig: go.Figure, title: str, x_title: str = "", y_title: str = "", he
         hoverlabel=dict(font=dict(family=FONT)),
         bargap=0.25,
     )
-    fig.update_xaxes(title_text=x_title, gridcolor=GRID, zeroline=False, linecolor=GRID, tickfont=dict(color=MUTED))
-    fig.update_yaxes(title_text=y_title, gridcolor=GRID, zeroline=False, linecolor=GRID, tickfont=dict(color=MUTED))
+    fig.update_xaxes(title_text=x_title, gridcolor=GRID, zeroline=False, linecolor=GRID, tickfont=dict(color=MUTED),
+                     automargin=True)
+    fig.update_yaxes(title_text=y_title, gridcolor=GRID, zeroline=False, linecolor=GRID, tickfont=dict(color=MUTED),
+                     automargin=True)
     return fig
 
 

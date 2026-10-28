@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -92,6 +92,27 @@ def ask(q: Question) -> dict:
 def reset(s: Session) -> dict:
     """Forget a conversation, so the next question starts a new topic."""
     return {"session_id": s.session_id, "reset": get_orchestrator().memory.reset(s.session_id)}
+
+
+class ReportRequest(BaseModel):
+    turns: list[dict] = Field(..., max_length=200, description="Answers exactly as /ask returned them")
+    title: str | None = Field(None, max_length=120)
+
+
+@app.post("/report", response_class=Response,
+          responses={200: {"content": {"application/pdf": {}}, "description": "The conversation as a PDF"}})
+def report(r: ReportRequest) -> Response:
+    """Turn a list of answers (from /ask) into a PDF report with the charts as images."""
+    from backend.report import build_pdf
+    s = system_status()
+    meta = {"graph": "Neo4j" if s["graph"].get("backend") == "neo4j" else "NetworkX",
+            "llm": s["llm"].get("model") if s["llm"].get("enabled") else "off (rules)"}
+    if r.title:
+        meta["title"] = r.title
+    pdf, stats = build_pdf(r.turns, meta)
+    return Response(pdf, media_type="application/pdf", headers={
+        "Content-Disposition": 'attachment; filename="va-chatbot-report.pdf"',
+        "X-Charts": str(stats["charts"]), "X-Chart-Images": str(stats["images"])})
 
 
 @app.get("/health")

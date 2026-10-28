@@ -41,7 +41,7 @@ and without a Groq key it uses its rule-based parser and template text.
 ```powershell
 python -m etl.run_all                  # clean -> borders -> DuckDB -> Neo4j
 python -m tests.check_neo4j_parity     # proves Neo4j answers == reference answers
-python -m pytest -q                    # 68 automated tests
+python -m pytest -q                    # 91 automated tests
 ```
 (`python -m etl.run_all --no-neo4j` if Neo4j is not running yet.
 Stop the API and the chat UI before re-running the ETL, because DuckDB allows only one writer.)
@@ -66,6 +66,7 @@ The chatbot remembers each conversation, so short follow-ups work:
 | Only the ones in Bavaria | the same, restricted to Bavaria |
 | What about deaths? | the same, with deaths instead of incidence |
 | Now as a map | the same measure, drawn as a map |
+| What does this chart show? | **explains the previous chart in words**: what it is, how to read it, what it tells us, what to keep in mind (no new query, no new chart) |
 
 Also: "What about Hamburg?" (swap the place), "also add Hessen" (add a place),
 "its neighbours", "Which of them are hotspots?", "and within 3?", and answering
@@ -89,6 +90,22 @@ With an LLM key, the model also sees a ~100-token summary of the previous plan
 **API:** `POST /ask` accepts and returns a `session_id`; send it back with the next question.
 `POST /reset {"session_id": ...}` forgets a conversation. The chat screen does this for you;
 its "New topic" button clears the memory.
+
+## Timestamps and PDF export
+
+* Every question and answer in the chat shows **when it was asked and answered**
+  ("🕒 asked 28 Oct 2026, 14:37:05", "🕒 answered … · answered in 0.8 s").
+  The backend stamps each answer (`asked_at`, `answered_at`, ISO 8601 with time zone).
+* Top right of the chat: **📄 Export to PDF**, then **⬇ Download PDF** (also in the sidebar).
+  The report has a cover page indexing every question with its time, then one page per
+  question: time, engine, follow-up note, answer text, KPIs, **the chart as an image**,
+  and the data table. (The technical "How this was answered" part stays in the chat only.)
+* How: `backend/report.py`. ReportLab lays out the PDF; Kaleido renders each Plotly chart
+  to PNG in a headless Chrome. Kaleido uses your installed Chrome; if none is found it
+  downloads one once (needs internet that one time). Map outlines come from the bundled
+  `frontend/static/topojson`, served by a tiny local web server, so no CDN is needed.
+  If a chart can't be drawn, the PDF still builds with a note in its place.
+* API: `POST /report {"turns": [answers from /ask]}` returns the PDF.
 
 ## 4. Benchmark (which engine is faster for what)
 
@@ -142,8 +159,8 @@ Writes `benchmarks/results.csv` and an interactive `benchmarks/results.html`.
 ```
 data/        raw CSV, derived files (clean.parquet, adjacency.json, covid.duckdb)
 etl/         clean.py, build_adjacency.py, load_duckdb.py, graph_payload.py, load_neo4j.py, run_all.py
-backend/     config, catalog, entities, nlu, followup, memory, llm, sql_engine, graph_engine, charts, narrator, orchestrator, main (API)
+backend/     config, catalog, entities, nlu, followup, memory, explain, llm, sql_engine, graph_engine, charts, narrator, report (PDF), orchestrator, main (API)
 frontend/    app.py (Streamlit) + static/topojson (map outlines, served locally)
 benchmarks/  run_benchmark.py
-tests/       test_pipeline.py, test_memory.py, check_neo4j_parity.py
+tests/       test_pipeline.py, test_memory.py, test_report.py, check_neo4j_parity.py
 ```

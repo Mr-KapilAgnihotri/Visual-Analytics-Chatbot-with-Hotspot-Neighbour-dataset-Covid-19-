@@ -17,3 +17,6 @@ streamlit>=1.45
 requests>=2.31
 pytest>=8.0
 httpx>=0.27          # used by the API tests (FastAPI TestClient)
+reportlab>=4.0       # PDF export: page layout
+kaleido>=1.0         # PDF export: Plotly chart -> PNG (uses Chrome; downloads one if missing)
+pypdf>=4.0           # used by the PDF tests

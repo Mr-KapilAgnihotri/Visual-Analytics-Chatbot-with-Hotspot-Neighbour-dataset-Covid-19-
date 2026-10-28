@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import sys
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -96,8 +97,37 @@ if "session_id" not in st.session_state:
 
 
 # ---------------------------------------------------------------------------
+# timestamps
+# ---------------------------------------------------------------------------
+def now_iso() -> str:
+    return datetime.now().astimezone().isoformat(timespec="milliseconds")
+
+
+def stamp(iso: str | None) -> str:
+    """'28 Oct 2026, 14:37:05' from an ISO time; empty if missing."""
+    try:
+        return datetime.fromisoformat(iso).strftime("%d %b %Y, %H:%M:%S")
+    except (TypeError, ValueError):
+        return ""
+
+
+def took(a: dict) -> str:
+    try:
+        s = (datetime.fromisoformat(a["answered_at"]) - datetime.fromisoformat(a["asked_at"])).total_seconds()
+        return f" · answered in {s:.1f} s"
+    except (KeyError, TypeError, ValueError):
+        return ""
+
+
+# ---------------------------------------------------------------------------
 # rendering one answer
 # ---------------------------------------------------------------------------
+def render_question(q: str, a: dict) -> None:
+    st.markdown(q)
+    if a.get("asked_at"):
+        st.caption(f"🕒 asked {stamp(a['asked_at'])}")
+
+
 def render_answer(a: dict, key: str) -> None:
     if a.get("followup"):
         st.caption("↪ " + a["followup"])                     # how a follow-up was understood
@@ -127,6 +157,22 @@ def render_answer(a: dict, key: str) -> None:
                 st.code(q["text"], language=LANG.get(q["language"], "text"))
             with st.popover("Query plan (JSON)"):
                 st.json(plan)
+    if a.get("answered_at"):
+        st.caption(f"🕒 answered {stamp(a['answered_at'])}{took(a)}")
+
+
+# ---------------------------------------------------------------------------
+# PDF export
+# ---------------------------------------------------------------------------
+def prepare_pdf() -> None:
+    from backend.report import build_pdf
+    s = status()
+    meta = {"graph": "Neo4j" if s.get("graph", {}).get("backend") == "neo4j" else "NetworkX",
+            "llm": s.get("llm", {}).get("model") if s.get("llm", {}).get("enabled") else "off (rules)"}
+    turns = [t["a"] | {"question": t["q"]} for t in st.session_state["history"]]
+    pdf, stats = build_pdf(turns, meta)
+    st.session_state["pdf"] = {"bytes": pdf, "stats": stats, "n": len(turns),
+                               "name": f"va-chatbot-{datetime.now():%Y%m%d-%H%M}.pdf"}
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +181,8 @@ def render_answer(a: dict, key: str) -> None:
 with st.sidebar:
     st.header("📊 VA Chatbot")
     st.caption("COVID-19 in Germany's 411 districts, 2020 · Knowledge graph + relational database")
+    side_export = st.container()       # filled at the end, so it counts the newest question
+    st.divider()
     s = status()
     g, llm = s.get("graph", {}), s.get("llm", {})
     st.markdown(f"**Mode:** {'FastAPI backend' if st.session_state['mode'] == 'api' else 'in-process'}")
@@ -155,30 +203,64 @@ with st.sidebar:
     st.caption("Follow-ups work: try \"And on 1 December?\", \"Show their trend\", \"What about Hamburg?\".")
     if st.button("New topic (clear conversation and memory)", use_container_width=True):
         st.session_state["history"] = []
+        st.session_state.pop("pdf", None)
         reset_memory()
         st.rerun()
 
 # ---------------------------------------------------------------------------
 # main chat
 # ---------------------------------------------------------------------------
-st.title("Ask about COVID-19 in Germany, 2020")
+title_col, export_col = st.columns([4, 1], vertical_alignment="bottom")
+title_col.title("Ask about COVID-19 in Germany, 2020")
+top_export = export_col.container()    # filled at the end, so it counts the newest question
 if not st.session_state["history"]:
     st.info("Ask in plain English, e.g. *\"Which districts border Köln?\"* or "
             "*\"Top 10 districts by incidence on 15 November\"*. Examples are in the sidebar.")
 
 for i, turn in enumerate(st.session_state["history"]):
     with st.chat_message("user"):
-        st.markdown(turn["q"])
+        render_question(turn["q"], turn["a"])
     with st.chat_message("assistant"):
         render_answer(turn["a"], str(i))
 
 question = st.chat_input("Ask a question about the data…")
 question = question or st.session_state.pop("pending", None)
 if question:
+    asked_at = now_iso()
     with st.chat_message("user"):
         st.markdown(question)
+        st.caption(f"🕒 asked {stamp(asked_at)}")
     with st.chat_message("assistant"):
         with st.spinner("Thinking: parsing → querying → charting → explaining…"):
             answer = ask(question)
+        answer.setdefault("asked_at", asked_at)       # e.g. an API error carries no times
+        answer.setdefault("answered_at", now_iso())
         render_answer(answer, str(len(st.session_state["history"])))
     st.session_state["history"].append({"q": question, "a": answer})
+
+# ---------------------------------------------------------------------------
+# export to PDF: top right of the chat AND top of the sidebar.
+# Drawn last, so it already counts the question that was just answered.
+# ---------------------------------------------------------------------------
+def export_controls(where: str) -> None:
+    n = len(st.session_state["history"])
+    if st.button("📄 Export to PDF", key=f"pdf-make-{where}", use_container_width=True, type="primary",
+                 disabled=n == 0, help="Save this conversation, with its charts, as a PDF"):
+        with st.spinner("Drawing the charts and building the PDF…"):
+            prepare_pdf()
+    pdf = st.session_state.get("pdf")
+    if pdf and pdf["n"] == n:                          # only offer a PDF that matches the chat
+        st.download_button("⬇ Download PDF", pdf["bytes"], file_name=pdf["name"], key=f"pdf-get-{where}",
+                           mime="application/pdf", use_container_width=True)
+        s_ = pdf["stats"]
+        st.caption(f"{n} question{'s' if n != 1 else ''} · {s_['images']} of {s_['charts']} charts as images")
+        if s_["image_errors"]:
+            st.caption("Some charts could not be drawn: " + s_["image_errors"][0][:150])
+    elif n == 0:
+        st.caption("Ask a question first, then export.")
+
+
+with top_export:
+    export_controls("top")
+with side_export:
+    export_controls("side")

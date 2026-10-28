@@ -156,8 +156,11 @@ def resolve(new, last, question: str, make_plan, district_name: dict, district_s
         else:
             if base["intent"] == "shortest_path" and len(new_d) == 1 and prev.get("districts"):
                 new_d = prev["districts"][:1] + new_d                   # "and to Passau?" keeps the start
+            same = ({x["id"] for x in new_d}, set(new_s)) == ({x["id"] for x in prev.get("districts", [])},
+                                                              set(prev.get("states", [])))
             base["districts"], base["states"] = new_d, new_s
-            changed.append(_describe_places(base))
+            if not same:
+                changed.append(_describe_places(base))
     elif plural and (result_districts or last.result_states):
         if result_districts:
             base["districts"], base["states"] = result_districts, []

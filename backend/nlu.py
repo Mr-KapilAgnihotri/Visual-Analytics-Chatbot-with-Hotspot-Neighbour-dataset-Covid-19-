@@ -117,6 +117,11 @@ def rule_plan(question: str, ex: Extraction) -> QueryPlan:
     fq = fold(question)
     p = QueryPlan()
     explicit: set[str] = set()
+    from backend.explain import is_explain_request
+    if is_explain_request(question):              # "what does this chart show?" is about the last answer
+        p.intent = "explain"
+        p.explicit = ["intent"]
+        return p
     for intent, pattern in RULES:
         if re.search(pattern, q) or re.search(pattern, fq):
             p.intent = intent
@@ -222,7 +227,7 @@ fields the new question changes (omit the rest); never copy unchanged fields."""
 
 
 def _llm_system() -> str:
-    intents = "\n".join(f" {k}: {v[1]}" for k, v in INTENTS.items())
+    intents = "\n".join(f" {k}: {v[1]}" for k, v in INTENTS.items() if k != "explain")
     metrics = ", ".join(f"{k} ({v['label']})" for k, v in METRICS.items())
     return SYSTEM_PROMPT.format(first=config.FIRST_DATE, last=config.LAST_DATE,
                                 intents=intents, metrics=metrics)
@@ -242,7 +247,7 @@ def merge_llm(plan: QueryPlan, js: dict, linker: EntityLinker, question: str) ->
     predictable; the LLM is used for what they could not read."""
     p = QueryPlan(**plan.to_dict())
     known = set(plan.explicit)
-    if js.get("intent") in INTENTS and "intent" not in known:
+    if js.get("intent") in INTENTS and js.get("intent") != "explain" and "intent" not in known:
         p.intent = js["intent"]
     if "metric" not in known:
         if js.get("metric") in METRICS:
@@ -301,6 +306,8 @@ def understand(question: str, linker: EntityLinker, last=None) -> tuple[QueryPla
 
     ex = linker.extract(question)
     plan = rule_plan(question, ex)
+    if plan.intent == "explain":                  # needs no new data, so no LLM parsing and no follow-up merge
+        return plan, ex
     llm = get_llm()
     if llm.enabled:
         found = {"districts": [d.name for d in ex.districts], "states": [s.name for s in ex.states],

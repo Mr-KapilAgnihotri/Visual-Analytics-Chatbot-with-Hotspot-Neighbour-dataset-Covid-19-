@@ -18,6 +18,7 @@ from __future__ import annotations
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import date as _date
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -29,6 +30,7 @@ from backend.charts import CONTEXT, FOCUS, HOTSPOT, SERIES, fmt
 from backend.entities import EntityLinker
 from backend.graph_engine import GraphResult, get_graph, graph_status
 from backend.memory import ConversationStore, Turn
+from backend.explain import explain
 from backend.narrator import narrate
 from backend.nlu import QueryPlan, understand
 from backend.sql_engine import SqlResult, get_sql
@@ -62,9 +64,16 @@ class Answer:
     graph_backend: str = ""
     session_id: str | None = None
     followup: str | None = None          # how a follow-up was interpreted, shown to the user
+    asked_at: str | None = None          # ISO 8601 with time zone, e.g. 2026-10-28T14:37:05+01:00
+    answered_at: str | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+def _now() -> str:
+    """Local time with its time-zone offset, to the millisecond."""
+    return datetime.now().astimezone().isoformat(timespec="milliseconds")
 
 
 def _d(s: str | None) -> str:
@@ -86,7 +95,14 @@ class Orchestrator:
     # ------------------------------------------------------------------
     def ask(self, question: str, session_id: str | None = None) -> Answer:
         """Answer one question. With a session_id, earlier turns of that conversation are
-        remembered, so follow-ups ("and on 1 December?", "their trend") work."""
+        remembered, so follow-ups ("and on 1 December?", "their trend") work.
+        Every answer is stamped with when it was asked and when it was answered."""
+        asked_at = _now()
+        ans = self._ask(question, session_id)
+        ans.asked_at, ans.answered_at = asked_at, _now()
+        return ans
+
+    def _ask(self, question: str, session_id: str | None) -> Answer:
         t0 = time.perf_counter()
         self._queries: list[dict] = []
         last = self.memory.last(session_id)
@@ -103,6 +119,16 @@ class Orchestrator:
             return ans
         if plan.intent == "help":
             ans.text, ans.engine = HELP_TEXT, "NONE"
+            return ans
+        if plan.intent == "explain":
+            # about the previous chart: no new query, no new chart. Not remembered, so a later
+            # "and on 1 December?" still refers to the chart that was explained.
+            fallback, facts = explain(question, last)
+            ans.text, ans.narrative_source = narrate(question, "", facts, fallback) if facts else (fallback, "template")
+            ans.engine, ans.facts = "NONE", facts
+            if last is not None and facts:
+                ans.followup = f'Explaining the chart of "{last.question}"'
+            ans.timings = {"nlu_ms": round(t_nlu, 1), "total_ms": round((time.perf_counter() - t0) * 1000, 1)}
             return ans
 
         t1 = time.perf_counter()
@@ -129,13 +155,16 @@ class Orchestrator:
             "narrate_ms": round(t_narr, 1),
             "total_ms": round((time.perf_counter() - t0) * 1000, 1),
         }
-        self._remember(session_id, question, plan, table)
+        self._remember(session_id, question, plan, table,
+                       {"intent": plan.intent, "metric": plan.metric, "chart_title": chart_desc,
+                        "facts": facts, "text": ans.text})
         return ans
 
     # ------------------------------------------------------------------
     # memory
     # ------------------------------------------------------------------
-    def _remember(self, session_id: str | None, question: str, plan: QueryPlan, table: list) -> None:
+    def _remember(self, session_id: str | None, question: str, plan: QueryPlan, table: list,
+                  answer: dict | None = None) -> None:
         """Store this turn: the plan, plus WHICH districts/states the answer showed
         (so a later "their" or "them" points at exactly what was on screen)."""
         if not session_id:
@@ -158,7 +187,7 @@ class Orchestrator:
             ids = [i for i in ids if i in set(self.districts["district_id"])] if plan.intent == "compare" else []
         states = states or list(plan.states)
         self.memory.add(session_id, Turn(question=question, plan=plan.to_dict(),
-                                         result_ids=ids[:50], result_states=states))
+                                         result_ids=ids[:50], result_states=states, answer=answer or {}))
 
     # ------------------------------------------------------------------
     # helpers
@@ -356,7 +385,7 @@ class Orchestrator:
             facts["data_note"] = ("Mobility is recorded per federal state, so each point is a state; "
                                   "using districts would repeat the same mobility value many times.")
         text = (f"Across {st['n']} {unit} ({when}) there is {strength}{direction} linear relationship between "
-                f"{lx.lower()} and {ly.lower()} (Pearson r = {fmt(r) if r is not None else 'n/a'}). "
+                f"{lx.lower()} and {ly.lower()} (Pearson r = {f'{r:.2f}' if r is not None else 'n/a'}). "
                 f"{facts['caveat']}")
         return fig, facts, text, self._records(df), []
 
@@ -397,7 +426,9 @@ class Orchestrator:
         if metric == "incidence_7d":
             facts["hotspots"] = int((df["value"] >= config.HOTSPOT_THRESHOLD).sum())
             by_state = df.assign(h=df["value"] >= config.HOTSPOT_THRESHOLD).groupby("state")["h"].mean()
-            facts["state_with_highest_hotspot_share"] = by_state.idxmax()
+            top_share = float(by_state.max())                  # several states can tie (e.g. at 100%)
+            facts["states_with_highest_hotspot_share"] = sorted(by_state[by_state == top_share].index)
+            facts["highest_state_hotspot_share_pct"] = round(100 * top_share, 1)
         text = (f"The map shows {lab.lower()} for all {len(df)} districts {when}. The highest value is in "
                 f"{top.iloc[0]['name']} ({fmt(top.iloc[0]['value'])}); the median district has {fmt(facts['median'])}.")
         if "hotspots" in facts:

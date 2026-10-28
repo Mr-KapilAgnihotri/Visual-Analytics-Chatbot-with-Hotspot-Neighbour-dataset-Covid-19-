@@ -40,6 +40,7 @@ class Turn:
     result_ids: list = field(default_factory=list)
     result_states: list = field(default_factory=list)
     ts: float = 0.0
+    answer: dict = field(default_factory=dict)   # intent, chart title, facts, text: for "explain this chart"
 
 
 class ConversationStore:

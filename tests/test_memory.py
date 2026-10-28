@@ -161,3 +161,38 @@ def test_api_session_and_reset():
         assert r3["reset"] is True
         r4 = client.post("/ask", json={"question": "What about Hamburg?", "session_id": r1["session_id"]}).json()
         assert r4["followup"] is None
+
+
+# ---------------------------------------------------------------- "explain this chart" (found in a user's PDF)
+@pytest.mark.parametrize("q", [
+    "could you please explain this leipzig chart",
+    "tell me what does this chart denote? i donot want a visual again but just knowledge about this graph",
+    "what does this graph show?", "explain it", "what does r mean here?", "what is shown in this map?",
+])
+def test_explain_previous_chart(orch, q):
+    s = uuid.uuid4().hex
+    orch.ask("Top 10 districts by incidence on 31 December", s)
+    a = orch.ask(q, s)
+    assert a.intent == "explain" and a.chart is None and a.engine == "NONE"
+    assert "How to read it" in a.text and "Vogtlandkreis" in a.text      # guide + the previous answer
+    # explaining does not replace the memory: the next follow-up still refers to the ranking
+    b = orch.ask("And on 1 December?", s)
+    assert b.intent == "top_n" and b.plan["date"] == "2020-12-01"
+
+
+def test_explain_without_a_chart(orch):
+    a = orch.ask("explain this chart", uuid.uuid4().hex)
+    assert a.intent == "explain" and "no chart yet" in a.text
+
+
+@pytest.mark.parametrize("q", ["Show me a map of incidence", "Map of incidence on 20 December",
+                               "describe the trend in Bavaria", "Tell me about Leipzig"])
+def test_new_questions_are_not_explanations(orch, q):
+    assert orch.ask(q, uuid.uuid4().hex).intent != "explain"
+
+
+def test_same_place_is_not_reported_as_changed(orch):
+    s = uuid.uuid4().hex
+    orch.ask("Tell me about Leipzig", s)
+    a = orch.ask("and what about Leipzig in November?", s)
+    assert "changed Leipzig" not in (a.followup or "")
